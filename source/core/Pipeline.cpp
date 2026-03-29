@@ -7,9 +7,11 @@
 //
 
 #include <string.h>
+#include <chrono>
 #include "core/Pipeline.hpp"
 #include "core/Backend.hpp"
 #include "core/Macro.h"
+#include "core/TraceUtils.hpp"
 #include "core/TensorUtils.hpp"
 #include "core/WrapExecution.hpp"
 #include "geometry/GeometryComputerUtils.hpp"
@@ -20,6 +22,91 @@
 //#define MNN_OP_SEPERATE
 //#define MNN_PIPELINE_DEBUG
 namespace MNN {
+static std::string _tensorShapeString(const Tensor* tensor) {
+    if (nullptr == tensor) {
+        return "[]";
+    }
+    std::string shape = "[";
+    for (int i = 0; i < tensor->dimensions(); ++i) {
+        if (i > 0) {
+            shape += "x";
+        }
+        shape += std::to_string(tensor->length(i));
+    }
+    shape += "]";
+    return shape;
+}
+
+static std::string _opDisplayName(const Op* op) {
+    if (nullptr != op && nullptr != op->name()) {
+        return op->name()->str();
+    }
+    if (nullptr != op) {
+        return EnumNameOpType(op->type());
+    }
+    return "Unknown";
+}
+
+class FallbackExecutionWrapper : public Execution {
+public:
+    FallbackExecutionWrapper(std::shared_ptr<Execution> execution, const Op* op, const CreateExecutionErrorInfo& info)
+        : Execution(execution->backend()), mWrapped(std::move(execution)), mOp(op), mInfo(info) {
+        mNeedAllocIO = mWrapped->needAllocIO();
+        mValid = mWrapped->valid();
+    }
+
+    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override {
+        mInputs = inputs;
+        mOutputs = outputs;
+        mSeenOnResize = true;
+        if (MNN::openCLLogEnabled()) {
+            std::string message = "op=" + _opDisplayName(mOp) + ", type=" + std::string(EnumNameOpType(mOp->type())) +
+                                  ", reason=" + mInfo.reason + ", detail=" + mInfo.detail;
+            if (!inputs.empty()) {
+                message += ", input0=" + _tensorShapeString(inputs[0]);
+            }
+            if (!outputs.empty()) {
+                message += ", output0=" + _tensorShapeString(outputs[0]);
+            }
+            MNN_PRINT("[OpenCLProfile][Fallback] %s\n", message.c_str());
+        }
+        MNN::ScopedTrace trace(std::string("MNN/OCL/Fallback/Resize/") + _opDisplayName(mOp));
+        return mWrapped->onResize(inputs, outputs);
+    }
+
+    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override {
+        ++mExecuteCount;
+        MNN::ScopedTrace trace(std::string("MNN/OCL/Fallback/Execute/") + _opDisplayName(mOp));
+        auto begin = std::chrono::steady_clock::now();
+        auto code = mWrapped->onExecute(inputs, outputs);
+        if (MNN::openCLLogEnabled()) {
+            auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+            std::string cadence = mExecuteCount == 1 ? "first_run" : "recurring";
+            std::string message = "op=" + _opDisplayName(mOp) + ", type=" + std::string(EnumNameOpType(mOp->type())) +
+                                  ", backend=CPU, reason=" + mInfo.reason +
+                                  ", host_us=" + std::to_string(costUs) +
+                                  ", cadence=" + cadence;
+            if (!inputs.empty()) {
+                message += ", input0=" + _tensorShapeString(inputs[0]);
+            }
+            if (!outputs.empty()) {
+                message += ", output0=" + _tensorShapeString(outputs[0]);
+            }
+            MNN_PRINT("[OpenCLProfile][FallbackExec] %s\n", message.c_str());
+        }
+        return code;
+    }
+
+private:
+    std::shared_ptr<Execution> mWrapped;
+    const Op* mOp = nullptr;
+    CreateExecutionErrorInfo mInfo;
+    std::vector<Tensor*> mInputs;
+    std::vector<Tensor*> mOutputs;
+    int mExecuteCount = 0;
+    bool mSeenOnResize = false;
+};
+
 static std::set<OpType> _getQuantPropagateOp(Runtime::CompilerType type) {
     std::set<OpType> propagateOpTypes = { OpType_Raster, OpType_ReLU, OpType_ReLU6, OpType_Pooling,
                                           OpType_Interp, OpType_CropAndResize, OpType_ROIPooling};
@@ -561,8 +648,11 @@ static ErrorCode _createExecutions(Schedule::PipelineInfo& mInfo, const std::str
                 }
             }
             std::shared_ptr<BufferStorage> tmpStorage;
+            CreateExecutionErrorInfo createErrorInfo;
             if (nullptr == iter.execution) {
+                mBackend->clearLastCreateExecutionError();
                 iter.execution.reset(OpCommonUtils::createExecutionWithExternal(mBackend.get(), iter.inputs, iter.outputs, iter.op, &loader, tmpStorage));
+                mBackend->getLastCreateExecutionError(createErrorInfo);
             }
             if (nullptr == iter.execution) {
                 // Try Backup
@@ -572,6 +662,9 @@ static ErrorCode _createExecutions(Schedule::PipelineInfo& mInfo, const std::str
                         MNN_ERROR("Create execution error : %d\n", iter.op->type());
                     }
                     return NOT_SUPPORT;
+                }
+                if (createErrorInfo.valid) {
+                    iter.execution.reset(new FallbackExecutionWrapper(iter.execution, iter.op, createErrorInfo));
                 }
             }
             if (nullptr != tmpStorage.get()) {
@@ -1004,7 +1097,14 @@ ErrorCode Pipeline::_allocForTensor(int index, bool allocInput) {
 #ifdef MNN_PIPELINE_DEBUG
                 resizeNumber++;
 #endif
+                auto resizeName = _opDisplayName(iter.op);
+                MNN::ScopedTrace resizeTrace(std::string("MNN/Pipeline/ResizeOp/") + resizeName);
+                auto resizeBegin = std::chrono::steady_clock::now();
                 auto code = iter.execution->onResize(iter.workInputs, iter.workOutputs);
+                if (MNN::openCLLogEnabled()) {
+                    auto resizeCostUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - resizeBegin).count();
+                    MNN_PRINT("[OpenCLProfile][OpResize] name=%s, type=%s, backend=%d, host_us=%lld\n", resizeName.c_str(), EnumNameOpType(iter.op->type()), iter.execution->backend()->type(), (long long)resizeCostUs);
+                }
                 if (NO_ERROR != code) {
 #ifdef MNN_PIPELINE_DEBUG
                     MNN_ERROR("Pipeline Resize error: %d\n", code);
@@ -1130,6 +1230,8 @@ void Pipeline::_copyInputs() {
     }
 }
 ErrorCode Pipeline::execute() {
+    MNN::ScopedTrace trace(std::string("MNN/Pipeline/Execute/") + std::to_string(getMainForwardType()));
+    auto pipelineBegin = std::chrono::steady_clock::now();
     _copyInputs();
     auto enterCode = _enterExecute();
     if (NO_ERROR != enterCode) {
@@ -1144,6 +1246,9 @@ ErrorCode Pipeline::execute() {
         auto& buffer = info.executeBuffer;
         for (int cmdIndex=0; cmdIndex<buffer.command.size(); ++cmdIndex) {
             auto& cmd = *buffer.command[cmdIndex];
+            auto opName = _opDisplayName(cmd.op);
+            MNN::ScopedTrace opTrace(std::string("MNN/Pipeline/Op/") + opName);
+            auto opBegin = std::chrono::steady_clock::now();
 #ifdef MNN_PIPELINE_DEBUG
             if (info.op->name() != nullptr) {
                 std::string groupOfInput = "input group: [";
@@ -1165,6 +1270,10 @@ ErrorCode Pipeline::execute() {
             }
 #endif
             auto code = cmd.execution->onExecute(cmd.workInputs, cmd.workOutputs);
+            if (MNN::openCLLogEnabled()) {
+                auto opCostUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - opBegin).count();
+                MNN_PRINT("[OpenCLProfile][Op] name=%s, type=%s, backend=%d, host_us=%lld\n", opName.c_str(), EnumNameOpType(cmd.op->type()), cmd.execution->backend()->type(), (long long)opCostUs);
+            }
             if (NO_ERROR != code) {
                 _exitExecute();
                 return code;
@@ -1172,11 +1281,16 @@ ErrorCode Pipeline::execute() {
         }
     }
     _exitExecute();
+    if (MNN::openCLLogEnabled()) {
+        auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pipelineBegin).count();
+        MNN_PRINT("[OpenCLProfile][Pipeline] forward_type=%d, host_total_us=%lld\n", getMainForwardType(), (long long)costUs);
+    }
     return NO_ERROR;
 }
 ErrorCode Pipeline::_enterExecute() {
     auto& mBackend = mInfo.first.cache.first;
     auto& mBackupBackend = mInfo.first.cache.second;
+    MNN::traceBegin("MNN/Pipeline/BackendExecuteBegin");
     mBackend->onExecuteBegin();
     mBackupBackend->onExecuteBegin();
     if (mRuntime->pCurrentStatus != NO_ERROR) {
@@ -1192,6 +1306,7 @@ void Pipeline::_exitExecute() {
     auto& mBackupBackend = mInfo.first.cache.second;
     mBackupBackend->onExecuteEnd();
     mBackend->onExecuteEnd();
+    MNN::traceEnd();
 }
 
 ErrorCode Pipeline::executeCallBack(const TensorCallBackWithInfo& before, const TensorCallBackWithInfo& after) {

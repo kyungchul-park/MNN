@@ -8,6 +8,7 @@
 
 #include "backend/opencl/core/OpenCLBackend.hpp"
 #include "MNN_generated.h"
+#include <chrono>
 
 #include "core/BufferAllocator.hpp"
 #include "core/TensorUtils.hpp"
@@ -21,12 +22,42 @@
 #ifdef  __ANDROID__
 #include <GLES2/gl2.h>
 #endif
+#include "core/TraceUtils.hpp"
 //#define OPENCL_FALLBACK_LOG
 namespace MNN {
 namespace OpenCL {
 #ifndef MNN_OPENCL_SEP_BUILD
 void registerOpenCLOps();
 #endif
+
+static std::string _tensorShapeString(const Tensor* tensor) {
+    if (nullptr == tensor) {
+        return "[]";
+    }
+    std::string shape = "[";
+    for (int i = 0; i < tensor->dimensions(); ++i) {
+        if (i > 0) {
+            shape += "x";
+        }
+        shape += std::to_string(tensor->length(i));
+    }
+    shape += "]";
+    return shape;
+}
+
+static std::string _storageTypeString(Backend::StorageType storageType) {
+    switch (storageType) {
+        case Backend::STATIC:
+            return "static";
+        case Backend::DYNAMIC:
+            return "dynamic";
+        case Backend::DYNAMIC_SEPERATE:
+            return "dynamic_separate";
+        case Backend::DYNAMIC_IN_EXECUTION:
+            return "dynamic_in_execution";
+    }
+    return "unknown";
+}
 
 
 CLRuntime::CLRuntime(const Backend::Info& info){
@@ -413,6 +444,7 @@ float OpenCLBackend::getBytes(const Tensor* tensor) {
 }
 
 Backend::MemObj* OpenCLBackend::onAcquire(const Tensor* nativeTensor, StorageType storageType) {
+    MNN::ScopedTrace trace(std::string("MNN/OCL/Acquire/") + _storageTypeString(storageType));
     #ifdef LOG_VERBOSE
     MNN_PRINT("Start OpenCLBackend::onAcquireBuffer !\n");
     #endif
@@ -456,16 +488,25 @@ Backend::MemObj* OpenCLBackend::onAcquire(const Tensor* nativeTensor, StorageTyp
         if (storageType == DYNAMIC_SEPERATE) {
             auto buffer = mBufferPool->alloc(size*typeSize, true);
             ((Tensor*)nativeTensor)->buffer().device = (uint64_t)buffer;
+            if (mOpenCLRuntime->isLogEnabled()) {
+                mOpenCLRuntime->logProfile("Acquire", "mem=buffer, storage=" + _storageTypeString(storageType) + ", bytes=" + std::to_string((int64_t)(size * typeSize)) + ", shape=" + _tensorShapeString(nativeTensor));
+            }
             return new CLMemReleaseBuffer(buffer, mBufferPool);
         }
         if (storageType == DYNAMIC) {
             auto buffer = mBufferPool->alloc(size*typeSize);
             ((Tensor*)nativeTensor)->buffer().device = (uint64_t)buffer;
+            if (mOpenCLRuntime->isLogEnabled()) {
+                mOpenCLRuntime->logProfile("Acquire", "mem=buffer, storage=" + _storageTypeString(storageType) + ", bytes=" + std::to_string((int64_t)(size * typeSize)) + ", shape=" + _tensorShapeString(nativeTensor));
+            }
             return new CLMemReleaseBuffer(buffer, mBufferPool);
         }
         if (storageType == DYNAMIC_IN_EXECUTION){
             auto node = mExecutionBufferPool->alloc(size*typeSize);
             ((Tensor*)nativeTensor)->buffer().device = reinterpret_cast<uint64_t>(node.get());
+            if (mOpenCLRuntime->isLogEnabled()) {
+                mOpenCLRuntime->logProfile("Acquire", "mem=buffer, storage=" + _storageTypeString(storageType) + ", bytes=" + std::to_string((int64_t)(size * typeSize)) + ", shape=" + _tensorShapeString(nativeTensor));
+            }
             return new CLReleaseExecutionBuffer(node, mExecutionBufferPool.get());
         }
         MNN_ASSERT(storageType == STATIC);
@@ -473,10 +514,16 @@ Backend::MemObj* OpenCLBackend::onAcquire(const Tensor* nativeTensor, StorageTyp
         {
             auto buffer = mStaticAllocatorMMap->allocBuffer(size*typeSize).get();
             ((Tensor*)nativeTensor)->buffer().device = (uint64_t)buffer; // fix
+            if (mOpenCLRuntime->isLogEnabled()) {
+                mOpenCLRuntime->logProfile("Acquire", "mem=buffer_mmap, storage=" + _storageTypeString(storageType) + ", bytes=" + std::to_string((int64_t)(size * typeSize)) + ", shape=" + _tensorShapeString(nativeTensor));
+            }
             return new CLMemReleaseMmapBuffer(buffer, mStaticAllocatorMMap.get());
         }else{
             auto buffer = mStaticBufferPool->alloc(size*typeSize);
             ((Tensor*)nativeTensor)->buffer().device = (uint64_t)buffer; // fix
+            if (mOpenCLRuntime->isLogEnabled()) {
+                mOpenCLRuntime->logProfile("Acquire", "mem=buffer, storage=" + _storageTypeString(storageType) + ", bytes=" + std::to_string((int64_t)(size * typeSize)) + ", shape=" + _tensorShapeString(nativeTensor));
+            }
             return new CLMemReleaseBuffer(buffer, mStaticBufferPool.get());
         }
     }
@@ -508,16 +555,25 @@ Backend::MemObj* OpenCLBackend::onAcquire(const Tensor* nativeTensor, StorageTyp
         if (storageType == DYNAMIC_SEPERATE) {
             auto image                               = mImagePool->alloc(imageWidth, imageHeight, dataType, true);
             ((Tensor*)nativeTensor)->buffer().device = (uint64_t)image; // fix
+            if (mOpenCLRuntime->isLogEnabled()) {
+                mOpenCLRuntime->logProfile("Acquire", "mem=image, storage=" + _storageTypeString(storageType) + ", width=" + std::to_string(imageWidth) + ", height=" + std::to_string(imageHeight) + ", shape=" + _tensorShapeString(nativeTensor));
+            }
             return new CLMemReleaseImage(image, mImagePool);
         }
         if (storageType == DYNAMIC) {
             auto image                               = mImagePool->alloc(imageWidth, imageHeight, dataType);
             ((Tensor*)nativeTensor)->buffer().device = (uint64_t)image; // fix
+            if (mOpenCLRuntime->isLogEnabled()) {
+                mOpenCLRuntime->logProfile("Acquire", "mem=image, storage=" + _storageTypeString(storageType) + ", width=" + std::to_string(imageWidth) + ", height=" + std::to_string(imageHeight) + ", shape=" + _tensorShapeString(nativeTensor));
+            }
             return new CLMemReleaseImage(image, mImagePool);
         }
         MNN_ASSERT(storageType == STATIC);
         auto image                               = mStaticImagePool->alloc(imageWidth, imageHeight, dataType);
         ((Tensor*)nativeTensor)->buffer().device = (uint64_t)image; // fix
+        if (mOpenCLRuntime->isLogEnabled()) {
+            mOpenCLRuntime->logProfile("Acquire", "mem=image, storage=" + _storageTypeString(storageType) + ", width=" + std::to_string(imageWidth) + ", height=" + std::to_string(imageHeight) + ", shape=" + _tensorShapeString(nativeTensor));
+        }
         return new CLMemReleaseImage(image, mStaticImagePool.get());
     }
 }
@@ -567,12 +623,18 @@ bool OpenCLBackend::onClearBuffer() {
 
 Execution* OpenCLBackend::onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                    const MNN::Op* op) {
+    clearLastCreateExecutionError();
+    MNN::ScopedTrace trace(std::string("MNN/OCL/Create/") + EnumNameOpType(op->type()));
 #ifdef LOG_VERBOSE
     MNN_PRINT("Start OpenCLBackend::onCreate \n");
 #endif
     auto creators = gCreator();
     auto iter      = creators->find(std::make_pair(op->type(), mMemType));
     if (0 != inputs.size() && (getDataType(inputs[0]) == DataType_DT_INT8 || inputs[0]->getType().bytes() == 1)) {
+        mLastCreateError.valid = true;
+        mLastCreateError.backend = "OpenCL";
+        mLastCreateError.reason = "unsupported_int8_input";
+        mLastCreateError.detail = "op=" + std::string(EnumNameOpType(op->type()));
         #ifdef OPENCL_FALLBACK_LOG
         MNN_PRINT("Don't support type %s for int8 input\n", EnumNameOpType(op->type()));
         #endif
@@ -586,6 +648,10 @@ Execution* OpenCLBackend::onCreate(const std::vector<Tensor*>& inputs, const std
     }
     if (iter == creators->end()) {
         mDivideOpRecord = true;
+        mLastCreateError.valid = true;
+        mLastCreateError.backend = "OpenCL";
+        mLastCreateError.reason = "missing_creator";
+        mLastCreateError.detail = "op=" + std::string(EnumNameOpType(op->type())) + ", mem=" + std::to_string((int)mMemType);
         #ifdef OPENCL_FALLBACK_LOG
         if (nullptr != op->name()) {
             MNN_PRINT("Don't support type %s memObject:%d, %s\n", EnumNameOpType(op->type()), mMemType, op->name()->c_str());
@@ -626,6 +692,10 @@ Execution* OpenCLBackend::onCreate(const std::vector<Tensor*>& inputs, const std
 
         if (!valid) {
             mDivideOpRecord = true;
+            mLastCreateError.valid = true;
+            mLastCreateError.backend = "OpenCL";
+            mLastCreateError.reason = "image_size_limit";
+            mLastCreateError.detail = "op=" + std::string(EnumNameOpType(op->type()));
             #ifdef OPENCL_FALLBACK_LOG
             for (auto t : inputs) {
                 auto tensorShape = OpenCL::tensorShapeFormat(t);
@@ -650,6 +720,10 @@ Execution* OpenCLBackend::onCreate(const std::vector<Tensor*>& inputs, const std
     auto exe = iter->second->onCreate(inputs, outputs, op, this);
     if (NULL == exe) {
         mDivideOpRecord = true;
+        mLastCreateError.valid = true;
+        mLastCreateError.backend = "OpenCL";
+        mLastCreateError.reason = "creator_returned_null";
+        mLastCreateError.detail = "op=" + std::string(EnumNameOpType(op->type())) + ", mem=" + std::to_string((int)mMemType);
         #ifdef OPENCL_FALLBACK_LOG
         if (nullptr != op->name()) {
             MNN_PRINT("The Creator Don't support type %s, memObject:%d, %s\n", MNN::EnumNameOpType(op->type()), mMemType, op->name()->c_str());
@@ -672,6 +746,7 @@ Execution* OpenCLBackend::onCreate(const std::vector<Tensor*>& inputs, const std
 }
 
 void OpenCLBackend::onResizeBegin() {
+    MNN::traceBegin("MNN/OCL/Backend/Resize");
 #ifndef ENABLE_OPENCL_TIME_PROFILER
     mOpenCLRuntime->setCommandQueueProfileEnable();
 #endif
@@ -688,10 +763,12 @@ ErrorCode OpenCLBackend::onResizeEnd() {
     if(!mRecordings.empty()){
         endRecord(mRecordings.back().record, true);
     }
+    MNN::traceEnd();
     return NO_ERROR;
 }
 
 void OpenCLBackend::onExecuteBegin() const {
+    MNN::traceBegin("MNN/OCL/Backend/Execute");
     mOpenCLRuntime->mQueueCount = 0;
     clearRecord();
     mOpenCLRuntime->clearEvent();
@@ -702,6 +779,7 @@ void OpenCLBackend::onExecuteEnd() const {
     clearRecord();
     enqeueRecord();
     mOpenCLRuntime->printEventTime();
+    MNN::traceEnd();
 }
 
 
@@ -805,7 +883,13 @@ void OpenCLBackend::copyToDeviceInt8(const Tensor* srcTensor, const Tensor* dstT
 }
 int OpenCLBackend::onSync(Tensor::MapType mtype, bool toCpu, const Tensor* dstTensor) {
     if (toCpu) {
+        MNN::ScopedTrace trace("MNN/OCL/Queue/Finish");
+        auto begin = std::chrono::steady_clock::now();
         mOpenCLRuntime->commandQueue().finish();
+        if (mOpenCLRuntime->isLogEnabled()) {
+            auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+            mOpenCLRuntime->logProfile("Sync", "to_cpu=1, host_wait_us=" + std::to_string(costUs));
+        }
     }
     return 0;
 }
@@ -865,6 +949,7 @@ void CLRuntime::convertFromDevice(const Tensor* srcTensor, const Tensor* dstTens
 }
 
 void OpenCLBackend::copyFromDevice(const Tensor* srcTensor, const Tensor* dstTensor) const{
+    MNN::ScopedTrace trace("MNN/OCL/Copy/FromDevice");
     auto needSize = dstTensor->size();
     auto shape = tensorShapeFormat(srcTensor);
     auto srcDimensionFormat = TensorUtils::getDescribe(srcTensor)->dimensionFormat;
@@ -890,7 +975,12 @@ void OpenCLBackend::copyFromDevice(const Tensor* srcTensor, const Tensor* dstTen
     #endif
     void* hostPtr = dstTensor->host<float>();
     if(directCopy){
+        auto begin = std::chrono::steady_clock::now();
         mOpenCLRuntime->commandQueue().enqueueReadBuffer(openCLBuffer(srcTensor), CL_TRUE, 0, needSize, hostPtr);
+        if (mOpenCLRuntime->isLogEnabled()) {
+            auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+            mOpenCLRuntime->logProfile("Memcpy", "type=read_buffer, host_wait_us=" + std::to_string(costUs) + ", bytes=" + std::to_string((int64_t)needSize));
+        }
         return;
     }
 
@@ -901,18 +991,36 @@ void OpenCLBackend::copyFromDevice(const Tensor* srcTensor, const Tensor* dstTen
     TensorUtils::getDescribe(&interTensor)->dimensionFormat = dstDimensionFormat;
     
     //Convert format
+    auto convertBegin = std::chrono::steady_clock::now();
     mCLRuntime->convertFromDevice(srcTensor, (const Tensor*)&interTensor, dstDimensionFormat, mPrecision, mMemType, false);
+    if (mOpenCLRuntime->isLogEnabled()) {
+        auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - convertBegin).count();
+        mOpenCLRuntime->logProfile("TensorConvert", "direction=device_to_host_staging, host_us=" + std::to_string(costUs) + ", dst_format=" + std::to_string((int)dstDimensionFormat));
+    }
     mOpenCLRuntime->printEventTime();
 
     cl_int res;
 #ifdef ENABLE_OPENCL_TIME_PROFILER
-    mOpenCLRuntime->commandQueue().finish();
+    {
+        MNN::ScopedTrace finishTrace("MNN/OCL/Queue/Finish");
+        mOpenCLRuntime->commandQueue().finish();
+    }
     {
         AUTOTIME;
+        auto readBegin = std::chrono::steady_clock::now();
         res = mOpenCLRuntime->commandQueue().enqueueReadBuffer(*mHostBuffer.second, CL_TRUE, 0, needSize, hostPtr);
+        if (mOpenCLRuntime->isLogEnabled()) {
+            auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - readBegin).count();
+            mOpenCLRuntime->logProfile("Memcpy", "type=read_staging, host_wait_us=" + std::to_string(costUs) + ", bytes=" + std::to_string((int64_t)needSize));
+        }
     }
 #else
+    auto readBegin = std::chrono::steady_clock::now();
     res = mOpenCLRuntime->commandQueue().enqueueReadBuffer(*mHostBuffer.second, CL_TRUE, 0, needSize, hostPtr);
+    if (mOpenCLRuntime->isLogEnabled()) {
+        auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - readBegin).count();
+        mOpenCLRuntime->logProfile("Memcpy", "type=read_staging, host_wait_us=" + std::to_string(costUs) + ", bytes=" + std::to_string((int64_t)needSize));
+    }
 #endif
 }
 
@@ -964,6 +1072,7 @@ void CLRuntime::convertToDevice(const Tensor* srcTensor, const Tensor* dstTensor
 
 
 void OpenCLBackend::copyToDevice(const Tensor* srcTensor, const Tensor* dstTensor) const{
+    MNN::ScopedTrace trace("MNN/OCL/Copy/ToDevice");
     auto needSize = srcTensor->size();
     auto shape = tensorShapeFormat(srcTensor);
     auto srcDimensionFormat = TensorUtils::getDescribe(srcTensor)->dimensionFormat;
@@ -975,7 +1084,12 @@ void OpenCLBackend::copyToDevice(const Tensor* srcTensor, const Tensor* dstTenso
         needSize /= 2;
         void *tmpPtr = malloc(needSize);
         ((half_float::half*)tmpPtr)[0] = (half_float::half)(((float*)hostPtr)[0]);
+        auto begin = std::chrono::steady_clock::now();
         mOpenCLRuntime->commandQueue().enqueueWriteBuffer(openCLBuffer(dstTensor), CL_TRUE, 0, needSize, tmpPtr);
+        if (mOpenCLRuntime->isLogEnabled()) {
+            auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+            mOpenCLRuntime->logProfile("Memcpy", "type=write_scalar_fp16, host_wait_us=" + std::to_string(costUs) + ", bytes=" + std::to_string((int64_t)needSize));
+        }
         free(tmpPtr);
         return;
     }
@@ -999,7 +1113,12 @@ void OpenCLBackend::copyToDevice(const Tensor* srcTensor, const Tensor* dstTenso
     }
     #endif
     if(directCopy){
+        auto begin = std::chrono::steady_clock::now();
         mOpenCLRuntime->commandQueue().enqueueWriteBuffer(openCLBuffer(dstTensor), CL_TRUE, 0, needSize, hostPtr);
+        if (mOpenCLRuntime->isLogEnabled()) {
+            auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+            mOpenCLRuntime->logProfile("Memcpy", "type=write_buffer, host_wait_us=" + std::to_string(costUs) + ", bytes=" + std::to_string((int64_t)needSize));
+        }
         return;
     }
 
@@ -1010,21 +1129,39 @@ void OpenCLBackend::copyToDevice(const Tensor* srcTensor, const Tensor* dstTenso
     TensorUtils::getDescribe(&interTensor)->dimensionFormat = srcDimensionFormat;
 
     #ifdef ENABLE_OPENCL_TIME_PROFILER
-    mOpenCLRuntime->commandQueue().finish();
+    {
+        MNN::ScopedTrace finishTrace("MNN/OCL/Queue/Finish");
+        mOpenCLRuntime->commandQueue().finish();
+    }
     {
         AUTOTIME;
+        auto writeBegin = std::chrono::steady_clock::now();
         mOpenCLRuntime->commandQueue().enqueueWriteBuffer(*mHostBuffer.second, CL_TRUE, 0, needSize, hostPtr);
+        if (mOpenCLRuntime->isLogEnabled()) {
+            auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - writeBegin).count();
+            mOpenCLRuntime->logProfile("Memcpy", "type=write_staging, host_wait_us=" + std::to_string(costUs) + ", bytes=" + std::to_string((int64_t)needSize));
+        }
     }
     #else
+    auto writeBegin = std::chrono::steady_clock::now();
     auto res = mOpenCLRuntime->commandQueue().enqueueWriteBuffer(*mHostBuffer.second, CL_TRUE, 0, needSize, hostPtr);
     if(res != CL_SUCCESS) {
         MNN_ERROR("OpenCL enqueue write error:%d\n", res);
         return;
     }
+    if (mOpenCLRuntime->isLogEnabled()) {
+        auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - writeBegin).count();
+        mOpenCLRuntime->logProfile("Memcpy", "type=write_staging, host_wait_us=" + std::to_string(costUs) + ", bytes=" + std::to_string((int64_t)needSize));
+    }
     #endif
 
     //Covert format
+    auto convertBegin = std::chrono::steady_clock::now();
     mCLRuntime->convertToDevice((const Tensor*)&interTensor, dstTensor, srcDimensionFormat, mPrecision, mMemType, false);
+    if (mOpenCLRuntime->isLogEnabled()) {
+        auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - convertBegin).count();
+        mOpenCLRuntime->logProfile("TensorConvert", "direction=host_staging_to_device, host_us=" + std::to_string(costUs) + ", src_format=" + std::to_string((int)srcDimensionFormat));
+    }
 }
 
 void OpenCLBackend::copyBetweenDevice(const Tensor* srcTensor, const Tensor* dstTensor) const{
@@ -1077,6 +1214,8 @@ void CLRuntime::copyBetweenDevice(const Tensor* srcTensor, const Tensor* dstTens
 
 
 void OpenCLBackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor) const {
+    MNN::ScopedTrace trace("MNN/OCL/CopyBuffer");
+    auto begin = std::chrono::steady_clock::now();
 #ifdef LOG_VERBOSE
     MNN_PRINT("Start onCopyBuffer !\n");
 #endif
@@ -1092,6 +1231,10 @@ void OpenCLBackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTenso
 #ifdef LOG_VERBOSE
     MNN_PRINT("end onCopyBuffer !\n");
 #endif
+    if (mOpenCLRuntime->isLogEnabled()) {
+        auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+        mOpenCLRuntime->logProfile("CopyBuffer", "host_total_us=" + std::to_string(costUs) + ", src=" + _tensorShapeString(srcTensor) + ", dst=" + _tensorShapeString(dstTensor));
+    }
 }
 
 void* OpenCLBackend::allocMapTensorMemory(int length, bool svmFlag, cl_device_svm_capabilities svm_cap_) {
@@ -1132,6 +1275,8 @@ void* OpenCLBackend::allocMapTensorMemory(int length, bool svmFlag, cl_device_sv
 }
 
 void* OpenCLBackend::onMapTensor(Tensor::MapType mtype, Tensor::DimensionType dtype, const Tensor* srcTensor) {
+    MNN::ScopedTrace trace("MNN/OCL/MapTensor");
+    auto begin = std::chrono::steady_clock::now();
     auto needSize = srcTensor->size();
     clearRecord();
 #ifdef MNN_OPENCL_SVM_ENABLE
@@ -1161,6 +1306,10 @@ void* OpenCLBackend::onMapTensor(Tensor::MapType mtype, Tensor::DimensionType dt
         if(svm_cap_ & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) {
             //Make sure command finished
             mOpenCLRuntime->commandQueue().finish();
+            if (mOpenCLRuntime->isLogEnabled()) {
+                auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+                mOpenCLRuntime->logProfile("Map", "type=svm_fine, host_us=" + std::to_string(costUs) + ", bytes=" + std::to_string((int64_t)needSize));
+            }
             return svmPtr;
         }
 
@@ -1172,6 +1321,10 @@ void* OpenCLBackend::onMapTensor(Tensor::MapType mtype, Tensor::DimensionType dt
         cl_int res = clEnqueueSVMMap(mOpenCLRuntime->commandQueue().get(), true, map_flag, svmPtr, needSize, 0, nullptr, nullptr);
 
         MNN_CHECK_CL_SUCCESS(res, "svm_map")
+        if (mOpenCLRuntime->isLogEnabled()) {
+            auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+            mOpenCLRuntime->logProfile("Map", "type=svm_coarse, host_us=" + std::to_string(costUs) + ", bytes=" + std::to_string((int64_t)needSize));
+        }
         return svmPtr;
     }
 #endif
@@ -1189,10 +1342,16 @@ void* OpenCLBackend::onMapTensor(Tensor::MapType mtype, Tensor::DimensionType dt
         //use onCopyBuffer
         onCopyBuffer(srcTensor, &tmpTensor);
     }
+    if (mOpenCLRuntime->isLogEnabled()) {
+        auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+        mOpenCLRuntime->logProfile("Map", "type=host_buffer, host_us=" + std::to_string(costUs) + ", bytes=" + std::to_string((int64_t)needSize));
+    }
     return svmPtr;
 }
 
 bool OpenCLBackend::onUnmapTensor(Tensor::MapType mtype, Tensor::DimensionType dtype, const Tensor* dstTensor, void* mapPtr) {
+    MNN::ScopedTrace trace("MNN/OCL/UnmapTensor");
+    auto begin = std::chrono::steady_clock::now();
 #ifdef MNN_OPENCL_SVM_ENABLE
     auto svm_cap_ = mOpenCLRuntime->getSvmCapabilities();
     if(mUseSvm) {// CL version beyond 2.0 & support svm
@@ -1218,6 +1377,10 @@ bool OpenCLBackend::onUnmapTensor(Tensor::MapType mtype, Tensor::DimensionType d
             mCLRuntime->convertToDevice(&interTensor, dstTensor, format_type, mPrecision, mMemType, true);
         }
         mOpenCLRuntime->commandQueue().finish();
+        if (mOpenCLRuntime->isLogEnabled()) {
+            auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+            mOpenCLRuntime->logProfile("Unmap", "type=svm, host_us=" + std::to_string(costUs));
+        }
 
         return true;
     }
@@ -1233,6 +1396,10 @@ bool OpenCLBackend::onUnmapTensor(Tensor::MapType mtype, Tensor::DimensionType d
 
         //use onCopyBuffer
         onCopyBuffer(&srcTensor, dstTensor);
+    }
+    if (mOpenCLRuntime->isLogEnabled()) {
+        auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+        mOpenCLRuntime->logProfile("Unmap", "type=host_buffer, host_us=" + std::to_string(costUs));
     }
     return true;
 }

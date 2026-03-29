@@ -25,6 +25,12 @@ class Execution;
 
 class Runtime;
 class Backend;
+struct CreateExecutionErrorInfo {
+    bool valid = false;
+    std::string backend;
+    std::string reason;
+    std::string detail;
+};
 struct RuntimeHint {
     // 0: Defer, 1: Eager
     int memoryAllocatorType = 0;
@@ -162,6 +168,15 @@ public:
      */
     virtual Execution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                 const MNN::Op* op) = 0;
+
+    virtual bool getLastCreateExecutionError(CreateExecutionErrorInfo& info) const {
+        info.valid = false;
+        return false;
+    }
+
+    virtual void clearLastCreateExecutionError() {
+        // Do nothing.
+    }
 
     /**
      * @brief callback before resize ops.

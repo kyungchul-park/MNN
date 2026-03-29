@@ -25,6 +25,7 @@
 #include "backend/opencl/core/runtime/OpenCLWrapper.hpp"
 #include "MNN/MNNForwardType.h"
 #include "core/TensorUtils.hpp"
+#include "core/TraceUtils.hpp"
 
 namespace MNN {
 
@@ -62,6 +63,14 @@ struct TuneInfo{
     std::vector<uint32_t>globalSize;
     std::vector<uint32_t>localSize;
     uint32_t timeCost;
+};
+
+struct OpenCLEventRecord {
+    std::string name;
+    cl::Event event;
+    double hostEnqueueUs = 0.0;
+    std::vector<uint32_t> globalSize;
+    std::vector<uint32_t> localSize;
 };
 
 class KernelWrap {
@@ -134,9 +143,8 @@ public:
     std::string getDeviceName() {
         return mDeviceName;
     }
-    void pushEvent(std::pair<std::string, cl::Event> data) {
-        return mEvents.push_back(data);
-    }
+    void pushEvent(const std::string& name, const cl::Event& event, double hostEnqueueUs = 0.0,
+                   const std::vector<uint32_t>& globalSize = {}, const std::vector<uint32_t>& localSize = {});
     unsigned int getEventTime(cl::Event& event);
     void printEventTime();
     void clearEvent(){
@@ -179,6 +187,20 @@ public:
     double getCostTime(const cl::Event *event);
     double getQueuedTime(const cl::Event *event);
     double getSubmitTime(const cl::Event *event);
+    bool isProfilingEnabled() const {
+        return mProfilingEnabled;
+    }
+    bool isTraceEnabled() const {
+        return mTraceEnabled;
+    }
+    bool isLogEnabled() const {
+        return mLogEnabled;
+    }
+    bool collectKernelEvents() const {
+        return mEnableEventProfiling;
+    }
+    std::string tensorShapeString(const Tensor* tensor) const;
+    void logProfile(const char* stage, const std::string& message) const;
 
     std::pair<const void*, size_t> makeCache(void* tuneInfo);
     bool setCache(std::pair<const void*, size_t> cache);
@@ -222,7 +244,7 @@ private:
     MaliAr mMaliAr;
     GpuLevel mGpuLevel = UNDEFINED;
     float mCLVersion = 1.0f;
-    std::vector<std::pair<std::string, cl::Event>> mEvents;
+    std::vector<OpenCLEventRecord> mEvents;
 
 #ifdef MNN_OPENCL_SVM_ENABLE
     cl_device_svm_capabilities mSvmCapabilities;
@@ -234,6 +256,10 @@ private:
     std::string mDefaultBuildParams;
     float mFlops = 4.0f;
     bool mIsCreateError{false};
+    bool mProfilingEnabled = false;
+    bool mTraceEnabled = false;
+    bool mLogEnabled = false;
+    bool mEnableEventProfiling = false;
     
     double mStartNanos;
     double mStopNanos;

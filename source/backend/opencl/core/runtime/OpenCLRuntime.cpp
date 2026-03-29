@@ -7,6 +7,7 @@
 //
 
 #include "backend/opencl/core/runtime/OpenCLRuntime.hpp"
+#include <chrono>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -58,6 +59,10 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
     mInitInfo.deviceId = deviceId;
     mInitInfo.contextPtr = contextPtr;
     mDefaultBuildParams = " -cl-mad-enable -w";
+    mTraceEnabled = MNN::openCLTraceEnabled();
+    mLogEnabled = MNN::openCLLogEnabled();
+    mProfilingEnabled = mTraceEnabled || mLogEnabled;
+    mEnableEventProfiling = mProfilingEnabled;
     std::vector<cl::Platform> platforms;
     cl_int res = cl::Platform::get(&platforms, platformSize);
     MNN_CHECK_CL_SUCCESS(res, "getPlatform");
@@ -110,7 +115,11 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
 
         #ifdef ENABLE_OPENCL_TIME_PROFILER
             properties |= CL_QUEUE_PROFILING_ENABLE;
+            mEnableEventProfiling = true;
         #endif
+            if (mEnableEventProfiling) {
+                properties |= CL_QUEUE_PROFILING_ENABLE;
+            }
             // if device is QUALCOMM's and version is 2.0 , set spacial optimized param
 
             sscanf(deviceVersion.c_str(), "%*s%f%*s", &mCLVersion);
@@ -240,11 +249,16 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
                     return;
                 }
 
-                cl_queue_properties prop[] = {CL_QUEUE_PRIORITY_KHR, CL_QUEUE_PRIORITY_LOW_KHR,
-#ifdef ENABLE_OPENCL_TIME_PROFILER
+                cl_queue_properties propWithProfile[] = {
+                    CL_QUEUE_PRIORITY_KHR, CL_QUEUE_PRIORITY_LOW_KHR,
                     CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE,
-#endif
-                    0};
+                    0
+                };
+                cl_queue_properties propNoProfile[] = {
+                    CL_QUEUE_PRIORITY_KHR, CL_QUEUE_PRIORITY_LOW_KHR,
+                    0
+                };
+                auto prop = mEnableEventProfiling ? propWithProfile : propNoProfile;
                 mCommandQueuePtr.reset(new cl::CommandQueue(clCreateCommandQueueWithProperties((*mContext).get(), (*mFirstGPUDevicePtr).get(), prop, &res)));
             }
             else
@@ -260,7 +274,8 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
 #ifdef ENABLE_OPENCL_TIME_PROFILER
             mCommandQueueTuning = mCommandQueuePtr;
 #else
-            mCommandQueueTuning = std::make_shared<cl::CommandQueue>(*mContext, *mFirstGPUDevicePtr, CL_QUEUE_PROFILING_ENABLE, &res);
+            auto tuningFlags = mEnableEventProfiling ? CL_QUEUE_PROFILING_ENABLE : 0;
+            mCommandQueueTuning = std::make_shared<cl::CommandQueue>(*mContext, *mFirstGPUDevicePtr, tuningFlags, &res);
 #endif
             mCurrentCommandQueue = mCommandQueuePtr.get();
             mFirstGPUDevicePtr->getInfo(CL_DEVICE_GLOBAL_MEM_CACHE_SIZE, &mGPUGlobalMemeryCacheSize);
@@ -467,7 +482,13 @@ bool OpenCLRuntime::loadProgram(const std::string &programName, cl::Program *pro
 
 bool OpenCLRuntime::buildProgram(const std::string &buildOptionsStr, cl::Program *program) {
     AUTOTIME;
+    MNN::ScopedTrace trace("MNN/OCL/BuildProgram");
+    auto begin = std::chrono::steady_clock::now();
     cl_int ret = program->build({*mFirstGPUDevicePtr}, buildOptionsStr.c_str());
+    auto buildCostUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+    if (mLogEnabled) {
+        logProfile("ProgramBuild", "host_us=" + std::to_string(buildCostUs) + ", options=" + buildOptionsStr);
+    }
     if (ret != CL_SUCCESS) {
         if (program->getBuildInfo<CL_PROGRAM_BUILD_STATUS>(*mFirstGPUDevicePtr) == CL_BUILD_ERROR) {
             std::string buildLog = program->getBuildInfo<CL_PROGRAM_BUILD_LOG>(*mFirstGPUDevicePtr);
@@ -488,6 +509,8 @@ std::shared_ptr<KernelWrap> OpenCLRuntime::buildKernel(const std::string &progra
 
 std::shared_ptr<KernelWrap> OpenCLRuntime::buildKernelWithCache(const std::string &programName, const std::string &kernelName,
                                       const std::set<std::string> &buildOptions, int precisionLevel, const Tensor *input, const Tensor *output, bool useCache) {
+    MNN::ScopedTrace trace(std::string("MNN/OCL/BuildKernel/") + programName + "/" + kernelName);
+    auto buildBegin = std::chrono::steady_clock::now();
     std::string buildOptionsStr;
     if (precisionLevel == 2) {// Fp16 Memory and fp16 compute
         buildOptionsStr = "-DFLOAT=half -DFLOAT2=half2 -DFLOAT3=half3 -DFLOAT4=half4 -DFLOAT8=half8 -DFLOAT16=half16 -DCOMPUTE_FLOAT=half  -DCOMPUTE_FLOAT2=half2 -DCOMPUTE_FLOAT3=half3 -DCOMPUTE_FLOAT4=half4 -DCOMPUTE_FLOAT8=half8 -DCOMPUTE_FLOAT16=half16 -DCONVERT_COMPUTE_FLOAT=convert_half -DCONVERT_COMPUTE_FLOAT2=convert_half2 -DCONVERT_COMPUTE_FLOAT3=convert_half3 -DCONVERT_COMPUTE_FLOAT4=convert_half4 -DCONVERT_COMPUTE_FLOAT8=convert_half8 -DCONVERT_COMPUTE_FLOAT16=convert_half16 -DRI_F=read_imageh -DWI_F=write_imageh -DCONVERT_FLOAT=convert_half  -DCONVERT_FLOAT2=convert_half2 -DCONVERT_FLOAT3=convert_half3 -DCONVERT_FLOAT4=convert_half4 -DCONVERT_FLOAT8=convert_half8 -DCONVERT_FLOAT16=convert_half16 -DMNN_SUPPORT_FP16";
@@ -629,6 +652,7 @@ std::shared_ptr<KernelWrap> OpenCLRuntime::buildKernelWithCache(const std::strin
     auto key = std::make_tuple(programName, buildOptionsStr);
 
     auto buildProgramInter = mBuildProgramMap.find(key);
+    bool programCacheHit = buildProgramInter != mBuildProgramMap.end();
     cl::Program program;
     if (buildProgramInter != mBuildProgramMap.end()) {
         program = buildProgramInter->second.program;
@@ -647,6 +671,7 @@ std::shared_ptr<KernelWrap> OpenCLRuntime::buildKernelWithCache(const std::strin
     auto kiter = buildProgramInter->second.kernels.find(kernelName);
     std::shared_ptr<cl::Kernel> kernel;
     bool firstCreate = false;
+    bool kernelCacheHit = kiter != buildProgramInter->second.kernels.end() && !kiter->second.recycle.empty();
     if (kiter == buildProgramInter->second.kernels.end()) {
         KernelPool pool;
         buildProgramInter->second.kernels.insert(std::make_pair(kernelName, pool));
@@ -668,6 +693,20 @@ std::shared_ptr<KernelWrap> OpenCLRuntime::buildKernelWithCache(const std::strin
         kiter->second.recycle.pop();
     }
     std::shared_ptr<KernelWrap> kw(new KernelWrap(kernel, &kiter->second));
+    if (mLogEnabled) {
+        auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - buildBegin).count();
+        std::string message = "kernel=" + kernelName + ", program=" + programName +
+                              ", host_us=" + std::to_string(costUs) +
+                              ", program_cache=" + std::string(programCacheHit ? "hit" : "miss") +
+                              ", kernel_cache=" + std::string(kernelCacheHit ? "hit" : "miss");
+        if (input != nullptr) {
+            message += ", input=" + tensorShapeString(input);
+        }
+        if (output != nullptr) {
+            message += ", output=" + tensorShapeString(output);
+        }
+        logProfile("KernelBuild", message);
+    }
     return kw;
 }
 
@@ -752,6 +791,39 @@ double OpenCLRuntime::getSubmitTime(const cl::Event *event){
     cl_int res = event->wait();
     MNN_CHECK_CL_SUCCESS(res, "clEvent");
     return (event->getProfilingInfo<CL_PROFILING_COMMAND_START>() - event->getProfilingInfo<CL_PROFILING_COMMAND_SUBMIT>()) / 1000.0;
+}
+
+void OpenCLRuntime::pushEvent(const std::string& name, const cl::Event& event, double hostEnqueueUs,
+                              const std::vector<uint32_t>& globalSize, const std::vector<uint32_t>& localSize) {
+    OpenCLEventRecord record;
+    record.name = name;
+    record.event = event;
+    record.hostEnqueueUs = hostEnqueueUs;
+    record.globalSize = globalSize;
+    record.localSize = localSize;
+    mEvents.emplace_back(std::move(record));
+}
+
+std::string OpenCLRuntime::tensorShapeString(const Tensor* tensor) const {
+    if (nullptr == tensor) {
+        return "[]";
+    }
+    std::string shape = "[";
+    for (int i = 0; i < tensor->dimensions(); ++i) {
+        if (i > 0) {
+            shape += "x";
+        }
+        shape += std::to_string(tensor->length(i));
+    }
+    shape += "]";
+    return shape;
+}
+
+void OpenCLRuntime::logProfile(const char* stage, const std::string& message) const {
+    if (!mLogEnabled) {
+        return;
+    }
+    MNN_PRINT("[OpenCLProfile][%s] %s\n", stage, message.c_str());
 }
 
 
@@ -1005,7 +1077,8 @@ unsigned int OpenCLRuntime::getEventTime(cl::Event& event){
 
 void OpenCLRuntime::printEventTime(){
 #ifdef ENABLE_OPENCL_TIME_PROFILER
-    if(mEvents.empty()){
+#endif
+    if(!mEnableEventProfiling || mEvents.empty()){
         return;
     }
     int raster_num = 0, raster_time = 0;
@@ -1015,52 +1088,83 @@ void OpenCLRuntime::printEventTime(){
 
     std::vector<std::pair<std::string, int>> kernels(mEvents.size());
     for(int i = 0; i < mEvents.size(); ++i){
-        auto event = &mEvents[i].second;
+        auto event = &mEvents[i].event;
+        auto waitBegin = std::chrono::steady_clock::now();
         cl_int res = event->wait();
+        auto waitCostUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waitBegin).count();
         MNN_CHECK_CL_SUCCESS(res, "clEvent");
+        auto queuedNanos = event->getProfilingInfo<CL_PROFILING_COMMAND_QUEUED>();
+        auto submitNanos = event->getProfilingInfo<CL_PROFILING_COMMAND_SUBMIT>();
         auto StartNanos = event->getProfilingInfo<CL_PROFILING_COMMAND_START>();
         auto StopNanos = event->getProfilingInfo<CL_PROFILING_COMMAND_END>();
         auto kernel_time = (unsigned int)((StopNanos - StartNanos) / 1000.0);
         mKernelTime += kernel_time;
-        if (mEvents[i].first.length() >= 15 && mEvents[i].first.substr(0, 15) == "ConvBuf2D-gemm2") {
+        if (mLogEnabled) {
+            std::string message = "name=" + mEvents[i].name +
+                                  ", host_enqueue_us=" + std::to_string((int)mEvents[i].hostEnqueueUs) +
+                                  ", queue_to_submit_us=" + std::to_string((int)((submitNanos - queuedNanos) / 1000.0)) +
+                                  ", submit_to_start_us=" + std::to_string((int)((StartNanos - submitNanos) / 1000.0)) +
+                                  ", device_exec_us=" + std::to_string((int)kernel_time) +
+                                  ", event_wait_us=" + std::to_string((int)waitCostUs);
+            if (!mEvents[i].globalSize.empty()) {
+                message += ", gws=";
+                for (int v = 0; v < mEvents[i].globalSize.size(); ++v) {
+                    if (v > 0) {
+                        message += "x";
+                    }
+                    message += std::to_string(mEvents[i].globalSize[v]);
+                }
+            }
+            if (!mEvents[i].localSize.empty()) {
+                message += ", lws=";
+                for (int v = 0; v < mEvents[i].localSize.size(); ++v) {
+                    if (v > 0) {
+                        message += "x";
+                    }
+                    message += std::to_string(mEvents[i].localSize[v]);
+                }
+            }
+            logProfile("Kernel", message);
+        }
+        if (mEvents[i].name.length() >= 15 && mEvents[i].name.substr(0, 15) == "ConvBuf2D-gemm2") {
             conv_gemm2_buf_time += kernel_time;
             conv_time += kernel_time;
-        } else if (mEvents[i].first.length() >= 15 && mEvents[i].first.substr(0, 15) == "ConvBuf2D-gemm1") {
+        } else if (mEvents[i].name.length() >= 15 && mEvents[i].name.substr(0, 15) == "ConvBuf2D-gemm1") {
             conv_gemm1_buf_time += kernel_time;
             conv_time += kernel_time;
-        } else if (mEvents[i].first.length() >= 17 && mEvents[i].first.substr(0, 17) == "ConvBuf2D-conv1x1") {
+        } else if (mEvents[i].name.length() >= 17 && mEvents[i].name.substr(0, 17) == "ConvBuf2D-conv1x1") {
             conv_1x1_buf_time += kernel_time;
             conv_time += kernel_time;
-        } else if (mEvents[i].first.length() >= 13 && mEvents[i].first.substr(0, 13) == "ConvBuf2D-ori") {
+        } else if (mEvents[i].name.length() >= 13 && mEvents[i].name.substr(0, 13) == "ConvBuf2D-ori") {
             conv_ori_buf_time += kernel_time;
             conv_time += kernel_time;
-        } else if (mEvents[i].first.length() >= 11 && mEvents[i].first.substr(0, 11) == "Convolution") {
+        } else if (mEvents[i].name.length() >= 11 && mEvents[i].name.substr(0, 11) == "Convolution") {
             conv_time += kernel_time;
-        } else if (mEvents[i].first.length() >= 8 && mEvents[i].first.substr(0, 8) == "Strassen") {
+        } else if (mEvents[i].name.length() >= 8 && mEvents[i].name.substr(0, 8) == "Strassen") {
             conv_time += kernel_time;
         }
-        if((mEvents[i].first.length() >= 10 && mEvents[i].first.substr(0, 10) == "While-gemm")) {
+        if((mEvents[i].name.length() >= 10 && mEvents[i].name.substr(0, 10) == "While-gemm")) {
             loop_bg_time += kernel_time;
         }
-        if((mEvents[i].first.length() >= 20 && mEvents[i].first.substr(0, 20) == "While-gemm-batchgemm")) {
+        if((mEvents[i].name.length() >= 20 && mEvents[i].name.substr(0, 20) == "While-gemm-batchgemm")) {
             loop_bg_gemm_time += kernel_time;
         }
-        if((mEvents[i].first.length() >= 18 && mEvents[i].first.substr(0, 18) == "While-gemm-softmax")) {
+        if((mEvents[i].name.length() >= 18 && mEvents[i].name.substr(0, 18) == "While-gemm-softmax")) {
             loop_softmax_time += kernel_time;
         }
-        if((mEvents[i].first.length() >= 7 && mEvents[i].first.substr(0, 7) == "Softmax")) {
+        if((mEvents[i].name.length() >= 7 && mEvents[i].name.substr(0, 7) == "Softmax")) {
             ori_softmax_time += kernel_time;
         }
-        if((mEvents[i].first.length() >= 23 && mEvents[i].first.substr(0, 23) == "Conv-winograd-batchgemm")) {
+        if((mEvents[i].name.length() >= 23 && mEvents[i].name.substr(0, 23) == "Conv-winograd-batchgemm")) {
             wino_gemm_time += kernel_time;
             conv_time += kernel_time;
         }
-        if((mEvents[i].first.length() >= 6 && mEvents[i].first.substr(0, 6) == "Raster")) {
+        if((mEvents[i].name.length() >= 6 && mEvents[i].name.substr(0, 6) == "Raster")) {
             raster_num++;
             raster_time += kernel_time;
         }
         
-        kernels[i] = std::make_pair(mEvents[i].first, kernel_time);
+        kernels[i] = std::make_pair(mEvents[i].name, kernel_time);
     }
 #ifdef SORT_PROFILE_TIME
     for(int i = 0; i < mEvents.size(); i++) {
@@ -1080,6 +1184,5 @@ void OpenCLRuntime::printEventTime(){
     }
     mEvents.clear();
     MNN_PRINT("total kernel time = %d  us, conv time = %d us (gemm2:%d us, gemm1:%d us, 1x1:%d us, ori:%d us, wino: %d us, other: %d us), while gemm time = %d us (core gemm time: %d us, softmax:%d us), ori softmax: %d us, raster[%d] time: %d us\n", mKernelTime, conv_time, conv_gemm2_buf_time, conv_gemm1_buf_time, conv_1x1_buf_time, conv_ori_buf_time, wino_gemm_time, conv_time-conv_gemm2_buf_time-conv_gemm1_buf_time-conv_1x1_buf_time-conv_ori_buf_time-wino_gemm_time, loop_bg_time, loop_bg_gemm_time, loop_softmax_time, ori_softmax_time, raster_num, raster_time);
-#endif
 }
 } // namespace MNN

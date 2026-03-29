@@ -7,6 +7,7 @@
 //
 
 #include "core/Session.hpp"
+#include <chrono>
 #include <string.h>
 #include <MNN/AutoTime.hpp>
 #include <map>
@@ -16,6 +17,7 @@
 #include "core/RuntimeFactory.hpp"
 #include "core/TensorUtils.hpp"
 #include "core/WrapExecution.hpp"
+#include "core/TraceUtils.hpp"
 #include "utils/InitNet.hpp"
 
 namespace MNN {
@@ -241,6 +243,8 @@ std::pair<const void*, size_t> Session::getCache() {
 }
 
 ErrorCode Session::run() const {
+    MNN::ScopedTrace trace("MNN/Session/Run");
+    auto begin = std::chrono::steady_clock::now();
     if (mNeedResize) {
         MNN_ERROR("Can't run session because not resized\n");
         return COMPUTE_SIZE_ERROR;
@@ -251,11 +255,16 @@ ErrorCode Session::run() const {
             return error;
         }
     }
+    if (MNN::openCLLogEnabled()) {
+        auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
+        MNN_PRINT("[OpenCLProfile][Inference] session_total_us=%lld, pipelines=%zu\n", (long long)costUs, mPipelines.size());
+    }
     return NO_ERROR;
 }
 
 ErrorCode Session::runWithCallBack(const TensorCallBackWithInfo& before, const TensorCallBackWithInfo& end,
                                    bool sync) const {
+    MNN::ScopedTrace trace("MNN/Session/RunWithCallback");
     if (mNeedResize) {
         MNN_ERROR("Can't run session because not resized\n");
         return COMPUTE_SIZE_ERROR;
@@ -270,6 +279,8 @@ ErrorCode Session::runWithCallBack(const TensorCallBackWithInfo& before, const T
 }
 
 ErrorCode Session::resize() {
+    MNN::ScopedTrace trace("MNN/Session/Resize");
+    auto resizeBegin = std::chrono::steady_clock::now();
 #ifdef LOG_VERBOSE
     for (auto& iter : mInfo.inputTensors) {
         auto& inputTensor = iter.second;
@@ -317,6 +328,10 @@ ErrorCode Session::resize() {
         }
         mNeedMalloc = false;
         mNeedResize = false;
+    }
+    if (MNN::openCLLogEnabled()) {
+        auto costUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - resizeBegin).count();
+        MNN_PRINT("[OpenCLProfile][Resize] session_resize_total_us=%lld\n", (long long)costUs);
     }
 
 #ifdef LOG_VERBOSE

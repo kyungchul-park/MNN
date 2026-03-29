@@ -91,6 +91,13 @@ public:
 
     virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs,
                                 const MNN::Op *op) override;
+    virtual bool getLastCreateExecutionError(CreateExecutionErrorInfo& info) const override {
+        info = mLastCreateError;
+        return info.valid;
+    }
+    virtual void clearLastCreateExecutionError() override {
+        mLastCreateError.valid = false;
+    }
 
     virtual void onResizeBegin() override;
     virtual ErrorCode onResizeEnd() override;
@@ -199,6 +206,7 @@ private:
     int mGpuMode;
     GpuMemObject mMemType = AUTO;
     CLTuneLevel mTuneLevel = Wide;
+    mutable CreateExecutionErrorInfo mLastCreateError;
 
 };
 

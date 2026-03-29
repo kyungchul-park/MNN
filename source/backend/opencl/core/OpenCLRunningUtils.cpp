@@ -9,6 +9,7 @@
 #include "backend/opencl/core/OpenCLRunningUtils.hpp"
 #include "backend/opencl/execution/cl/opencl_source_map.hpp"
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <math.h>
 #include <vector>
@@ -552,11 +553,13 @@ void run3DKernelDefault(const ::std::shared_ptr<KernelWrap> &kernelw, const std:
 #ifdef LOG_VERBOSE
     MNN_PRINT("start run3DKernelDefault !\n");
 #endif
+    MNN::ScopedTrace trace("MNN/OCL/Kernel/Run3D");
     auto kernel = kernelw->get();
 
     MNN_ASSERT(lws.size() >= 3);
 
     cl_int res = CL_SUCCESS;
+    auto enqueueBegin = std::chrono::steady_clock::now();
     if(lws[0]==0 || lws[1]==0 || lws[2]==0){
         res        = runtime->commandQueue().enqueueNDRangeKernel(
             kernel, cl::NullRange, cl::NDRange(gws[0], gws[1], gws[2]),
@@ -566,16 +569,22 @@ void run3DKernelDefault(const ::std::shared_ptr<KernelWrap> &kernelw, const std:
             kernel, cl::NullRange, cl::NDRange(gws[0], gws[1], gws[2]),
             cl::NDRange(lws[0], lws[1], lws[2]), nullptr, eventPtr);
     }
+    auto enqueueCostUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - enqueueBegin).count();
     MNN_CHECK_CL_SUCCESS(res, "run3d");
+    if (runtime->isLogEnabled()) {
+        runtime->logProfile("KernelEnqueue", "name=run3d, host_enqueue_us=" + std::to_string(enqueueCostUs));
+    }
 
     unsigned int num_flush = runtime->getQueueNum();
     if(runtime->getGpuType() != GpuType::ADRENO) {
         if(num_flush % 2 == 0) {
+            MNN::ScopedTrace flushTrace("MNN/OCL/Queue/Flush");
             runtime->commandQueue().flush();
         }
     }
     else {
         if(num_flush % 10 == 0) {
+            MNN::ScopedTrace flushTrace("MNN/OCL/Queue/Flush");
             runtime->commandQueue().flush();
         }
     }
@@ -590,8 +599,10 @@ void runKernel2D(const ::std::shared_ptr<KernelWrap> &kernelw, const std::vector
 #ifdef LOG_VERBOSE
     MNN_PRINT("start runKernel2D !\n");
 #endif
+    MNN::ScopedTrace trace("MNN/OCL/Kernel/Run2D");
     auto kernel = kernelw->get();
     cl_int res = CL_SUCCESS;
+    auto enqueueBegin = std::chrono::steady_clock::now();
     if(lws[0]==0 || lws[1]==0){
         res = runtime->commandQueue().enqueueNDRangeKernel(
             kernel, cl::NullRange, cl::NDRange(gws[0], gws[1]), cl::NullRange, nullptr, eventPtr);
@@ -600,16 +611,22 @@ void runKernel2D(const ::std::shared_ptr<KernelWrap> &kernelw, const std::vector
         res = runtime->commandQueue().enqueueNDRangeKernel(
             kernel, cl::NullRange, cl::NDRange(gws[0], gws[1]), cl::NDRange(lws[0], lws[1]), nullptr, eventPtr);
     }
+    auto enqueueCostUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - enqueueBegin).count();
     MNN_CHECK_CL_SUCCESS(res, "run2d");
+    if (runtime->isLogEnabled()) {
+        runtime->logProfile("KernelEnqueue", "name=run2d, host_enqueue_us=" + std::to_string(enqueueCostUs));
+    }
 
     unsigned int num_flush = runtime->getQueueNum();
     if(runtime->getGpuType() != GpuType::ADRENO) {
         if(num_flush % 2 == 0) {
+            MNN::ScopedTrace flushTrace("MNN/OCL/Queue/Flush");
             runtime->commandQueue().flush();
         }
     }
     else {
         if(num_flush % 10 == 0) {
+            MNN::ScopedTrace flushTrace("MNN/OCL/Queue/Flush");
             runtime->commandQueue().flush();
         }
     }
