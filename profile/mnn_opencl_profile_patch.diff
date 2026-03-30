@@ -1,0 +1,515 @@
+diff --git a/source/backend/opencl/CMakeLists.txt b/source/backend/opencl/CMakeLists.txt
+index 6bedec6..0000000 100644
+--- a/source/backend/opencl/CMakeLists.txt
++++ b/source/backend/opencl/CMakeLists.txt
+@@ -8,12 +8,18 @@ file(GLOB_RECURSE MNN_OpenCL_SRC ${CMAKE_CURRENT_LIST_DIR}/*)
+ 
+ option(MNN_OPENCL_SIZE_CUT "Disable MNN OpenCL Buffer Opt" OFF)
++option(MNN_CL_PROFILING_CSV "Emit per-frame OpenCL profiling CSV" OFF)
+ 
+ IF (MNN_GPU_TIME_PROFILE)
+     add_definitions(-DENABLE_OPENCL_TIME_PROFILER)
+ ENDIF()
++
++IF (MNN_CL_PROFILING_CSV)
++    add_definitions(-DMNN_CL_PROFILING_CSV)
++    add_definitions(-DOPENCL_FALLBACK_LOG)
++ENDIF()
+ 
+ IF (MNN_OPENCL_SIZE_CUT)
+     add_definitions(-DMNN_OPENCL_BUFFER_CLOSED)
+ ENDIF()
+ 
+diff --git a/source/backend/opencl/core/MNNCLProfileUtils.hpp b/source/backend/opencl/core/MNNCLProfileUtils.hpp
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/source/backend/opencl/core/MNNCLProfileUtils.hpp
+@@ -0,0 +1,230 @@
++#pragma once
++
++#include <stdint.h>
++#include <stdio.h>
++#include <mutex>
++#include <string>
++#include <chrono>
++#include <sstream>
++#include <vector>
++#include <unistd.h>
++#include <sys/syscall.h>
++
++#ifdef __ANDROID__
++#include <android/trace.h>
++#define MNN_ATRACE_BEGIN(name) ATrace_beginSection(name)
++#define MNN_ATRACE_END() ATrace_endSection()
++#define MNN_ATRACE_INT(name, value) ATrace_setCounter(name, value)
++#else
++#define MNN_ATRACE_BEGIN(name) ((void)0)
++#define MNN_ATRACE_END() ((void)0)
++#define MNN_ATRACE_INT(name, value) ((void)0)
++#endif
++
++namespace MNN {
++namespace OpenCL {
++
++inline uint64_t NowNs() {
++    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++inline int32_t GetTid() {
++#ifdef __ANDROID__
++    return (int32_t)syscall(__NR_gettid);
++#else
++    return (int32_t)getpid();
++#endif
++}
++
++static inline const char* RunCsvPath() {
++    return "/data/local/tmp/mnn_opencl_run.csv";
++}
++
++static inline const char* KernelCsvPath() {
++    return "/data/local/tmp/mnn_opencl_kernel.csv";
++}
++
++struct RunCsvRow {
++    uint64_t frame_id = 0;
++    int32_t pid = 0;
++    int32_t tid = 0;
++    uint64_t execute_begin_ns = 0;
++    uint64_t execute_end_ns = 0;
++    uint64_t execute_total_us = 0;
++    uint64_t wait_us = 0;
++    uint64_t readback_us = 0;
++    uint64_t write_us = 0;
++    uint64_t map_us = 0;
++    uint64_t unmap_us = 0;
++    uint64_t kernel_gpu_us_sum = 0;
++    uint64_t kernel_queue_to_submit_us_sum = 0;
++    uint64_t kernel_submit_to_start_us_sum = 0;
++    uint32_t num_kernels = 0;
++    uint32_t fallback_count = 0;
++    uint32_t resize_happened = 0;
++};
++
++struct KernelCsvRow {
++    uint64_t frame_id = 0;
++    uint32_t seq = 0;
++    std::string name;
++    uint64_t queued_ns = 0;
++    uint64_t submit_ns = 0;
++    uint64_t start_ns = 0;
++    uint64_t end_ns = 0;
++};
++
++class CsvWriter {
++public:
++    static CsvWriter& Get() {
++        static CsvWriter g;
++        return g;
++    }
++
++    void AppendRun(const RunCsvRow& r) {
++        std::lock_guard<std::mutex> lk(mMutex);
++        EnsureRunHeader();
++        FILE* fp = fopen(RunCsvPath(), "a");
++        if (!fp) {
++            return;
++        }
++        fprintf(fp,
++                "%llu,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u,%u\n",
++                (unsigned long long)r.frame_id,
++                (int)r.pid,
++                (int)r.tid,
++                (unsigned long long)r.execute_begin_ns,
++                (unsigned long long)r.execute_end_ns,
++                (unsigned long long)r.execute_total_us,
++                (unsigned long long)r.wait_us,
++                (unsigned long long)r.readback_us,
++                (unsigned long long)r.write_us,
++                (unsigned long long)r.map_us,
++                (unsigned long long)r.unmap_us,
++                (unsigned long long)r.kernel_gpu_us_sum,
++                (unsigned long long)r.kernel_queue_to_submit_us_sum,
++                (unsigned long long)r.kernel_submit_to_start_us_sum,
++                r.num_kernels,
++                r.fallback_count,
++                r.resize_happened);
++        fclose(fp);
++    }
++
++    void AppendKernel(const KernelCsvRow& r) {
++        std::lock_guard<std::mutex> lk(mMutex);
++        EnsureKernelHeader();
++        FILE* fp = fopen(KernelCsvPath(), "a");
++        if (!fp) {
++            return;
++        }
++        const uint64_t q2s = (r.submit_ns > r.queued_ns) ? (r.submit_ns - r.queued_ns) / 1000 : 0;
++        const uint64_t s2st = (r.start_ns > r.submit_ns) ? (r.start_ns - r.submit_ns) / 1000 : 0;
++        const uint64_t gpu = (r.end_ns > r.start_ns) ? (r.end_ns - r.start_ns) / 1000 : 0;
++        const uint64_t total = (r.end_ns > r.queued_ns) ? (r.end_ns - r.queued_ns) / 1000 : 0;
++        fprintf(fp,
++                "%llu,%u,%s,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
++                (unsigned long long)r.frame_id,
++                r.seq,
++                r.name.c_str(),
++                (unsigned long long)r.queued_ns,
++                (unsigned long long)r.submit_ns,
++                (unsigned long long)r.start_ns,
++                (unsigned long long)r.end_ns,
++                (unsigned long long)q2s,
++                (unsigned long long)s2st,
++                (unsigned long long)gpu,
++                (unsigned long long)total);
++        fclose(fp);
++    }
++
++private:
++    void EnsureRunHeader() {
++        if (mRunHeaderDone) {
++            return;
++        }
++        FILE* fp = fopen(RunCsvPath(), "r");
++        if (!fp) {
++            fp = fopen(RunCsvPath(), "w");
++            if (fp) {
++                fprintf(fp,
++                        "frame_id,pid,tid,execute_begin_ns,execute_end_ns,execute_total_us,wait_us,readback_us,write_us,map_us,unmap_us,"
++                        "kernel_gpu_us_sum,kernel_queue_to_submit_us_sum,kernel_submit_to_start_us_sum,"
++                        "num_kernels,fallback_count,resize_happened\n");
++                fclose(fp);
++            }
++        } else {
++            fclose(fp);
++        }
++        mRunHeaderDone = true;
++    }
++
++    void EnsureKernelHeader() {
++        if (mKernelHeaderDone) {
++            return;
++        }
++        FILE* fp = fopen(KernelCsvPath(), "r");
++        if (!fp) {
++            fp = fopen(KernelCsvPath(), "w");
++            if (fp) {
++                fprintf(fp,
++                        "frame_id,seq,name,queued_ns,submit_ns,start_ns,end_ns,"
++                        "queue_to_submit_us,submit_to_start_us,gpu_exec_us,total_event_us\n");
++                fclose(fp);
++            }
++        } else {
++            fclose(fp);
++        }
++        mKernelHeaderDone = true;
++    }
++
++private:
++    std::mutex mMutex;
++    bool mRunHeaderDone = false;
++    bool mKernelHeaderDone = false;
++};
++
++} // namespace OpenCL
++} // namespace MNN
++
+diff --git a/source/backend/opencl/core/runtime/OpenCLRuntime.hpp b/source/backend/opencl/core/runtime/OpenCLRuntime.hpp
+index 2cf15ec..2222222 100644
+--- a/source/backend/opencl/core/runtime/OpenCLRuntime.hpp
++++ b/source/backend/opencl/core/runtime/OpenCLRuntime.hpp
+@@ -19,6 +19,7 @@
+ #include "core/Macro.h"
+ #include "Type_generated.h"
+ #include "backend/opencl/core/runtime/OpenCLWrapper.hpp"
++#include "backend/opencl/core/MNNCLProfileUtils.hpp"
+ #include "MNN/MNNForwardType.h"
+ #include "core/TensorUtils.hpp"
+@@ -104,6 +105,28 @@ public:
+     std::string getDeviceName() {
+         return mDeviceName;
+     }
++
++    void beginFrameProfile(uint64_t frameId) {
++        mFrameRow = MNN::OpenCL::RunCsvRow{};
++        mFrameRow.frame_id = frameId;
++        mFrameRow.pid = (int32_t)getpid();
++        mFrameRow.tid = MNN::OpenCL::GetTid();
++        mFrameRow.execute_begin_ns = MNN::OpenCL::NowNs();
++    }
++
++    void finalizeFrameProfile();
++
++    void addWaitUs(uint64_t us) { mFrameRow.wait_us += us; }
++    void addReadbackUs(uint64_t us) { mFrameRow.readback_us += us; }
++    void addWriteUs(uint64_t us) { mFrameRow.write_us += us; }
++    void addMapUs(uint64_t us) { mFrameRow.map_us += us; }
++    void addUnmapUs(uint64_t us) { mFrameRow.unmap_us += us; }
++    void addFallback() { mFrameRow.fallback_count += 1; }
++    uint32_t fallbackCount() const { return mFrameRow.fallback_count; }
++    void markResize() { mFrameRow.resize_happened = 1; }
++
+     void pushEvent(std::pair<std::string, cl::Event> data) {
+         return mEvents.push_back(data);
+     }
+@@ -188,6 +211,7 @@ private:
+     float mCLVersion = 1.0f;
+     std::vector<std::pair<std::string, cl::Event>> mEvents;
++    MNN::OpenCL::RunCsvRow mFrameRow;
+ 
+ #ifdef MNN_OPENCL_SVM_ENABLE
+     cl_device_svm_capabilities mSvmCapabilities;
+diff --git a/source/backend/opencl/core/runtime/OpenCLRuntime.cpp b/source/backend/opencl/core/runtime/OpenCLRuntime.cpp
+index f00cdfc..3333333 100644
+--- a/source/backend/opencl/core/runtime/OpenCLRuntime.cpp
++++ b/source/backend/opencl/core/runtime/OpenCLRuntime.cpp
+@@ -465,6 +465,39 @@ unsigned int OpenCLRuntime::getEventTime(cl::Event& event){
+     return (unsigned int)((StopNanos - StartNanos) / 1000.0);
+ }
++
++void OpenCLRuntime::finalizeFrameProfile() {
++#ifdef MNN_CL_PROFILING_CSV
++    mFrameRow.execute_end_ns = MNN::OpenCL::NowNs();
++    if (mFrameRow.execute_end_ns > mFrameRow.execute_begin_ns) {
++        mFrameRow.execute_total_us = (mFrameRow.execute_end_ns - mFrameRow.execute_begin_ns) / 1000;
++    }
++    uint32_t seq = 0;
++    for (const auto& item : mEvents) {
++        auto event = item.second;
++        cl_int res = event.wait();
++        MNN_CHECK_CL_SUCCESS(res, "clEvent");
++
++        MNN::OpenCL::KernelCsvRow row;
++        row.frame_id = mFrameRow.frame_id;
++        row.seq = ++seq;
++        row.name = item.first;
++        row.queued_ns = event.getProfilingInfo<CL_PROFILING_COMMAND_QUEUED>();
++        row.submit_ns = event.getProfilingInfo<CL_PROFILING_COMMAND_SUBMIT>();
++        row.start_ns = event.getProfilingInfo<CL_PROFILING_COMMAND_START>();
++        row.end_ns = event.getProfilingInfo<CL_PROFILING_COMMAND_END>();
++
++        mFrameRow.kernel_queue_to_submit_us_sum += (row.submit_ns > row.queued_ns) ? (row.submit_ns - row.queued_ns) / 1000 : 0;
++        mFrameRow.kernel_submit_to_start_us_sum += (row.start_ns > row.submit_ns) ? (row.start_ns - row.submit_ns) / 1000 : 0;
++        mFrameRow.kernel_gpu_us_sum += (row.end_ns > row.start_ns) ? (row.end_ns - row.start_ns) / 1000 : 0;
++        mFrameRow.num_kernels += 1;
++        MNN::OpenCL::CsvWriter::Get().AppendKernel(row);
++    }
++    MNN::OpenCL::CsvWriter::Get().AppendRun(mFrameRow);
++#endif
++}
+ 
+ void OpenCLRuntime::printEventTime(){
+ #ifdef ENABLE_OPENCL_TIME_PROFILER
+diff --git a/source/backend/opencl/core/OpenCLBackend.cpp b/source/backend/opencl/core/OpenCLBackend.cpp
+index 52c6635..4444444 100644
+--- a/source/backend/opencl/core/OpenCLBackend.cpp
++++ b/source/backend/opencl/core/OpenCLBackend.cpp
+@@ -14,6 +14,7 @@
+ #include <map>
+ #include <mutex>
+ #include <thread>
++#include <atomic>
++#include "backend/opencl/core/MNNCLProfileUtils.hpp"
+ #include "core/Macro.h"
+ #include "runtime/OpenCLTuneInfo.hpp"
+ #include "core/MNNFileUtils.h"
+@@ -349,6 +350,10 @@ Execution* OpenCLBackend::onCreate(const std::vector<Tensor*>& inputs, const std
+         for (int i = 0; i < outputs.size(); ++i) {
+             TensorUtils::setTensorSupportPack(outputs[i], false);
+         }
++#ifdef MNN_CL_PROFILING_CSV
++        mOpenCLRuntime->addFallback();
++        MNN_ATRACE_INT("MNN_FallbackCount", (int64_t)mOpenCLRuntime->fallbackCount());
++#endif
+         return NULL;
+     }
+@@ -387,6 +392,10 @@ Execution* OpenCLBackend::onCreate(const std::vector<Tensor*>& inputs, const std
+             for (int i = 0; i < outputs.size(); ++i) {
+                 TensorUtils::setTensorSupportPack(outputs[i], false);
+             }
++#ifdef MNN_CL_PROFILING_CSV
++            mOpenCLRuntime->addFallback();
++            MNN_ATRACE_INT("MNN_FallbackCount", (int64_t)mOpenCLRuntime->fallbackCount());
++#endif
+             return NULL;
+         }
+     }
+@@ -406,6 +415,10 @@ Execution* OpenCLBackend::onCreate(const std::vector<Tensor*>& inputs, const std
+         for (int i = 0; i < outputs.size(); ++i) {
+             TensorUtils::setTensorSupportPack(outputs[i], false);
+         }
++#ifdef MNN_CL_PROFILING_CSV
++        mOpenCLRuntime->addFallback();
++        MNN_ATRACE_INT("MNN_FallbackCount", (int64_t)mOpenCLRuntime->fallbackCount());
++#endif
+         return NULL;
+     }
+ #ifdef LOG_VERBOSE
+@@ -416,6 +429,10 @@ Execution* OpenCLBackend::onCreate(const std::vector<Tensor*>& inputs, const std
+ void OpenCLBackend::onResizeBegin() {
+ #ifndef ENABLE_OPENCL_TIME_PROFILER
+     mOpenCLRuntime->setCommandQueueProfileEnable();
++#endif
++#ifdef MNN_CL_PROFILING_CSV
++    mOpenCLRuntime->markResize();
++    MNN_ATRACE_BEGIN("MNN::Resize");
+ #endif
+     // update mUseRecordableQueueSize if hint has changed
+     mUseRecordableQueueSize = mCLRuntime->hint().encorderNumForCommit <= mUseRecordableQueueSize ? mCLRuntime->hint().encorderNumForCommit : mUseRecordableQueueSize;
+@@ -429,16 +446,38 @@ ErrorCode OpenCLBackend::onResizeEnd() {
+     if(!mRecordings.empty()){
+         endRecord(mRecordings.back().record, true);
+     }
++#ifdef MNN_CL_PROFILING_CSV
++    MNN_ATRACE_END();
++#endif
+     return NO_ERROR;
+ }
+ 
+ void OpenCLBackend::onExecuteBegin() const {
+     mOpenCLRuntime->mQueueCount = 0;
+     clearRecord();
+     mOpenCLRuntime->clearEvent();
++#ifdef MNN_CL_PROFILING_CSV
++    static std::atomic<uint64_t> sFrameId{0};
++    const uint64_t frameId = ++sFrameId;
++    mOpenCLRuntime->beginFrameProfile(frameId);
++    MNN_ATRACE_BEGIN("MNN::Execute");
++    MNN_ATRACE_INT("MNN_FrameId", (int64_t)frameId);
++#endif
+ }
+ 
+ void OpenCLBackend::onExecuteEnd() const {
+     mOpenCLRuntime->mQueueCount = 0;
+     clearRecord();
+     enqeueRecord();
++#ifdef MNN_CL_PROFILING_CSV
++    mOpenCLRuntime->finalizeFrameProfile();
++    MNN_ATRACE_END();
++#endif
+     mOpenCLRuntime->printEventTime();
+ }
+@@ -544,8 +583,14 @@ int OpenCLBackend::onSync(Tensor::MapType mtype, bool toCpu, const Tensor* dstTe
+ int OpenCLBackend::onSync(Tensor::MapType mtype, bool toCpu, const Tensor* dstTensor) {
+     if (toCpu) {
++#ifdef MNN_CL_PROFILING_CSV
++        const uint64_t t0 = MNN::OpenCL::NowNs();
++        MNN_ATRACE_BEGIN("MNN::onSyncFinish");
++#endif
+         mOpenCLRuntime->commandQueue().finish();
++#ifdef MNN_CL_PROFILING_CSV
++        mOpenCLRuntime->addWaitUs((MNN::OpenCL::NowNs() - t0) / 1000);
++        MNN_ATRACE_END();
++#endif
+     }
+     return 0;
+ }
+@@ -640,7 +685,16 @@ void OpenCLBackend::copyFromDevice(const Tensor* srcTensor, const Tensor* dstTen
+     void* hostPtr = dstTensor->host<float>();
+     if(directCopy){
+-        mOpenCLRuntime->commandQueue().enqueueReadBuffer(openCLBuffer(srcTensor), CL_TRUE, 0, needSize, hostPtr);
++#ifdef MNN_CL_PROFILING_CSV
++        const uint64_t t0 = MNN::OpenCL::NowNs();
++        MNN_ATRACE_BEGIN("MNN::ReadbackDirect");
++#endif
++        mOpenCLRuntime->commandQueue().enqueueReadBuffer(openCLBuffer(srcTensor), CL_TRUE, 0, needSize, hostPtr);
++#ifdef MNN_CL_PROFILING_CSV
++        mOpenCLRuntime->addReadbackUs((MNN::OpenCL::NowNs() - t0) / 1000);
++        MNN_ATRACE_END();
++#endif
+         return;
+     }
+@@ -662,6 +716,10 @@ void OpenCLBackend::copyFromDevice(const Tensor* srcTensor, const Tensor* dstTen
+ 
+     cl_int res;
+ #ifdef ENABLE_OPENCL_TIME_PROFILER
++#ifdef MNN_CL_PROFILING_CSV
++    const uint64_t t0 = MNN::OpenCL::NowNs();
++    MNN_ATRACE_BEGIN("MNN::ReadbackHostBuffer");
++#endif
+     mOpenCLRuntime->commandQueue().finish();
+     {
+         AUTOTIME;
+@@ -669,8 +727,22 @@ void OpenCLBackend::copyFromDevice(const Tensor* srcTensor, const Tensor* dstTen
+     }
+ #else
++#ifdef MNN_CL_PROFILING_CSV
++    const uint64_t t0 = MNN::OpenCL::NowNs();
++    MNN_ATRACE_BEGIN("MNN::ReadbackHostBuffer");
++#endif
+     res = mOpenCLRuntime->commandQueue().enqueueReadBuffer(*mHostBuffer.second, CL_TRUE, 0, needSize, hostPtr);
+ #endif
++#ifdef MNN_CL_PROFILING_CSV
++    mOpenCLRuntime->addReadbackUs((MNN::OpenCL::NowNs() - t0) / 1000);
++    MNN_ATRACE_END();
++#endif
+ }
+@@ -702,7 +774,16 @@ void OpenCLBackend::copyToDevice(const Tensor* srcTensor, const Tensor* dstTenso
+     }
+     #endif
+     if(directCopy){
++#ifdef MNN_CL_PROFILING_CSV
++        const uint64_t t0 = MNN::OpenCL::NowNs();
++        MNN_ATRACE_BEGIN("MNN::WriteDirect");
++#endif
+         mOpenCLRuntime->commandQueue().enqueueWriteBuffer(openCLBuffer(dstTensor), CL_TRUE, 0, needSize, hostPtr);
++#ifdef MNN_CL_PROFILING_CSV
++        mOpenCLRuntime->addWriteUs((MNN::OpenCL::NowNs() - t0) / 1000);
++        MNN_ATRACE_END();
++#endif
+         return;
+     }
+ 
+@@ -714,6 +795,10 @@ void OpenCLBackend::copyToDevice(const Tensor* srcTensor, const Tensor* dstTenso
+     TensorUtils::getDescribe(&interTensor)->dimensionFormat = srcDimensionFormat;
+ 
+     #ifdef ENABLE_OPENCL_TIME_PROFILER
++#ifdef MNN_CL_PROFILING_CSV
++    const uint64_t t0 = MNN::OpenCL::NowNs();
++    MNN_ATRACE_BEGIN("MNN::WriteHostBuffer");
++#endif
+     mOpenCLRuntime->commandQueue().finish();
+     {
+         AUTOTIME;
+@@ -721,12 +806,24 @@ void OpenCLBackend::copyToDevice(const Tensor* srcTensor, const Tensor* dstTenso
+     }
+     #else
++#ifdef MNN_CL_PROFILING_CSV
++    const uint64_t t0 = MNN::OpenCL::NowNs();
++    MNN_ATRACE_BEGIN("MNN::WriteHostBuffer");
++#endif
+     auto res = mOpenCLRuntime->commandQueue().enqueueWriteBuffer(*mHostBuffer.second, CL_TRUE, 0, needSize, hostPtr);
+     if(res != CL_SUCCESS) {
+         MNN_ERROR("OpenCL enqueue write error:%d\n", res);
+         return;
+     }
+     #endif
++#ifdef MNN_CL_PROFILING_CSV
++    mOpenCLRuntime->addWriteUs((MNN::OpenCL::NowNs() - t0) / 1000);
++    MNN_ATRACE_END();
++#endif
+ 
+     //Covert format
+     mCLRuntime->convertToDevice((const Tensor*)&interTensor, dstTensor, srcDimensionFormat, mPrecision, mMemType, false);
+@@ -855,6 +952,10 @@ void* OpenCLBackend::onMapTensor(Tensor::MapType mtype, Tensor::DimensionType dt
+ 
+         cl_int res = clEnqueueSVMMap(mOpenCLRuntime->commandQueue().get(), true, map_flag, svmPtr, needSize, 0, nullptr, nullptr);
+ 
++#ifdef MNN_CL_PROFILING_CSV
++        mOpenCLRuntime->addMapUs(0); // keep csv column stable; replace with measured time if you use SVM heavily
++#endif
++
+         MNN_CHECK_CL_SUCCESS(res, "svm_map")
+         return svmPtr;
+     }
+@@ -877,6 +978,9 @@ bool OpenCLBackend::onUnmapTensor(Tensor::MapType mtype, Tensor::DimensionType d
+         if(!(svm_cap_ & CL_DEVICE_SVM_FINE_GRAIN_BUFFER)) {
+             cl_int res = clEnqueueSVMUnmap(mOpenCLRuntime->commandQueue().get(), svmPtr, 0, nullptr, nullptr);
+             MNN_CHECK_CL_SUCCESS(res, "svm_unmap")
++#ifdef MNN_CL_PROFILING_CSV
++            mOpenCLRuntime->addUnmapUs(0); // keep csv column stable; replace with measured time if you use SVM heavily
++#endif
+         }
+ 
+         if(mtype == Tensor::MAP_TENSOR_WRITE) {
